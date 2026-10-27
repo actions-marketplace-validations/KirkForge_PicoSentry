@@ -2,22 +2,205 @@
 
 *Tracked. Updated at session close. Head section = current state; below = session history.*
 
-# ═══ CURRENT STATE (2026-08-22, WO8.0.0 SEEDED — 22 WOs open; WO7.0.0 complete; v2.2.0 shipped; main = 8c3a68e2, dev = 5cfd0312) ═══
+# ═══ CURRENT STATE (2026-10-21, WO9.0.0 P0 cluster merged to dev, CI green; 4 real P0 bugs fixed, 1 closed as a false positive) ═══
 
-**WO8.0.0 series seeded** (22 WOs: P0×5, P1×10, P2×7) from a two-explorer round (scan+sandbox+watch / serve+core+deploy+firewall). All findings carry verified evidence (live repros or airtight file:line chains). Headline P0s: gRPC Scan orphaned running jobs on failure (001), gRPC Scan inline DoS (008), L4 profiler op-type blind (009), serve helm chart readOnlyRootFilesystem crash (101), serve helm chart path mismatch (102). Suggested batch shape in README.
+**Version**: 2.2.0 (pyproject.toml source of truth). Released 2026-08-20, live on PyPI.
 
-**WO7.0.0 series fully CLOSED** (34/34 DONE). Three waves of 2 subagents each (P0: 6 WOs, P1: 22 WOs, P2: 6 WOs), 6 worktrees total off `origin/dev`. Zero merge conflicts (disjoint file ownership verified pre-merge each wave). Orchestrator landed 3 riders (org_id threading, health probe lightweight, test fixes for health 503 on CI). Central gate green each wave: P0 5678, P1 5806, P2 **5854 passed / 0 failed / 37 skipped**. ruff/format/mypy clean (747 files, 417 source files). **main = `8c3a68e2`** (WO7 push CI green at that SHA); **dev = `5cfd0312`** (WO8 seeding commit, docs-only — safe to ff main when convenient).
+**Branch state**: `main` = `dev` = `c885eb3d` — **`main` fast-forwarded green-before-ff.**
+The ff was authorised by: dev push CI **39662046225 green at `0009c7a0`** (the P0 cluster, all
+jobs), the follow-up `6367ed60` green on **39692526428** (all five matrix legs + all four
+postgres-live legs) after the known WO9.0.0-011 flake was re-run at the same SHA, and
+`c885eb3d` being a **docs-only** commit on top of it (ci.yml `paths-ignore: '**.md'`,
+`docs/**` → CI skipped by design; the AGENTS.md rule says docs-only pushes that skip CI are
+safe to ff, and the non-doc tree at `c885eb3d` is byte-identical to the green `6367ed60`).
+Security Scan on `main` is green at `c885eb3d` (39694561006).
 
-**Migrations landed in WO7**: 24 (correlation_chains UNIQUE(org_id, artifact_id)), 25 (alerts `acknowledged` column separate from `sent`).
+**WO9.0.0 P0 cluster (2026-10-21)** — the five P0 work orders were re-verified against source
+before any of them was touched. Four were real bugs and are fixed; **one was a false positive
+and is closed as such** rather than "fixed":
 
-**Standing context**: green-before-ff rule in AGENTS.md §1.5; WO5 remainders: docker push (tooling-gated, runbook in WO5-014), WO5-029 <1s/MB target (12% landed, full fused pass pending), WO5-031 e2e isolation (core + helm chart landed, 2-worker e2e pending). Next free series: WO9.0.0.
+- **WO9.0.0-101 (serve) — webhook SSRF bypass via empty `pinned_ips`** — DONE.
+  `_load_webhooks` set `pinned_ips = resolve(host) or []` with no empty-check, so a hostname that
+  did not resolve loaded with an EMPTY pin set; at dispatch `set().issubset(set())` is True, so
+  the DNS-rebind guard passed vacuously and the POST went out with no IP restriction. The load
+  path now skips an unresolvable hostname (mirroring `create()`), and the dispatch guard rejects
+  an empty pin set OR an empty current set.
+- **WO9.0.0-102 (serve) — `acknowledge_alert` broke on Postgres** — DONE.
+  `alerts.acknowledged` is a BOOLEAN column but was missing from `_BOOL_LITERAL_RE`, so
+  `SET acknowledged = 1` reached postgres as an integer literal and the endpoint 500'd on every
+  Postgres deployment. Fixed systemically (translator + portable `= TRUE` at the call site).
+  **Rider**: the acknowledge test file is now in the `postgres-live-test` CI job — the bug was
+  invisible on SQLite, which is why it shipped for two releases — and a guard test in
+  `tests/test_ci_paths.py` pins that membership.
+- **WO9.0.0-001 (sandbox) — admission control was a complete no-op** — DONE.
+  The scanner read `verdict`/`findings`; the daemon emits `l3_verdict`/`l4_verdict`/
+  `findings_count` + an `analysis` dict, so every scan looked CLEAN and no pod was ever
+  blocked. Also fixed a severity CASE mismatch (findings are UPPERCASE, `SEVERITY_LEVELS` is
+  lowercase — every HIGH finding scored 0). An unreadable response (no verdict AND no findings)
+  now DENIES under the existing fail-closed default, so the next contract drift cannot silently
+  re-enable the no-op.
+- **WO9.0.0-002 (sandbox) — L4-PRIVESC-003 setuid-chmod detection was dead** — DONE.
+  The rule matched command prefixes ("chmod 4") against `op.path`, a FILE PATH, so it could never
+  fire. `FileOperation` now carries the chmod `mode` (which the profiler was matching with `\S+`
+  and discarding), and the rule tests the setuid (04000)/setgid (02000) bits of the octal mode.
+- **WO9.0.0-103 (deploy) — cosign double-v tag** — **NOT A BUG, false positive**, closed with the
+  re-verification. The cosign step is its own `run:` block and recomputes `TAG` WITHOUT the v
+  prefix, so `v${TAG}` is the same `:v2.2.0` the bake step pushes. The WO's proposed edit would
+  have signed `2.2.0` — a tag that does not exist — breaking every release. A test now runs the
+  REAL step bodies with stubbed docker/cosign and asserts every image reference resolves to the
+  same tag (mutation-checked).
 
-**The queue (next session — jump-in order)**:
-1. **WO8.0.0 P0 cluster** (5 WOs): sandbox 001/008/009 + deploy 101/102 — security/correctness, do first
-2. **WO8.0.0 P1 wave** (10 WOs): scan+sandbox+watch 002-005/007/010 + serve 103-106
-3. **WO8.0.0 P2 riders** (7 WOs): 006 + 107-112
-4. **WO5 remainders**: docker push (when tooling exists), WO5-029 fused-pass target, WO5-031 e2e isolation
-5. **Release v2.3.0** when ready (WO7.0.0 is a significant security/correctness wave — warrants a release; WO8 P0s should land first)
+**Two of the five bugs had tests that were validating the bug**: the admission mock daemon spoke
+a made-up response shape the scanner happened to read, and the setuid-chmod test put a command
+string in the PATH field. Both mocks/assertions now build their input from the PRODUCER's
+contract. See lessons.md 2026-10-21 for the generalizable lessons.
+
+**Gates (dev head `0009c7a0`)**: ruff All checks passed · format 763 files already formatted ·
+mypy 417 source files clean · `bash scripts/test.sh fast` **5995 passed / 37 skipped / 0 failed**
+(baseline 5965 — +30 tests, no test weakened) · push CI 39662046225 all-green at that headSha.
+
+**CI hardening (2026-10-21)**: the `test-matrix (3.13)` leg hung on a runner for 3h. It was a
+**runner flake**, not a regression — the previous push carried the whole P0 cluster and had 3.13
+green in 89s, the hanging push differed only by one test parameter, and the re-run had 3.13 green
+in 88s. The gap it exposed: **no job in `ci.yml` set `timeout-minutes`**, so every one inherited
+GitHub's 6h default cap and a hang was invisible until a human killed it. All 15 jobs now carry
+a bound sized from the observed green runtimes (15/20/30/45/180 min), with
+`tests/test_ci_paths.py::test_every_ci_job_has_a_timeout` pinning it so a new job cannot
+reintroduce the unbounded default. Python 3.13's default multiprocessing start method is now
+`forkserver` (3.10 uses `fork`) — the same class as WO5.0.0-035, and a known variable for any
+new test that waits on a spawned worker.
+
+**New WO9.0.0-108 (P1, found but NOT fixed)**: the scan daemon's SIGTERM/SIGINT handler calls
+`server.shutdown()` from the thread running `serve_forever()` — the documented deadlock shape
+(live repro proven both directions: hangs on the main thread, clean on a worker thread). Every
+`docker stop` / systemd stop / CI teardown of the daemon pays the full kill timeout. No test
+catches it because the daemon tests mock `HTTPServer` outright. See
+`docs/workorders/WO9.0.0-108-daemon-sigterm-shutdown-deadlock.md`.
+
+**WO9.0.0-011 recurred (2026-10-21) — the KNOWN flake, not a new one**: the docs-only commit
+`6367ed60` went red on `test-matrix (3.14)` with `published event id ... not in []`, the exact
+symptom that WO documents (root cause still unconfirmed there). Confirmed not a regression: my
+commits touch none of `event_bus` / `event_history` / `server.py` / the app lifespan; the test
+passes 5/5 in isolation and in the whole `tests/serve/` suite on 3.14; and
+`gh run rerun --failed` on the SAME SHA went **green** (run 39692526428 now `success`, all five
+matrix legs). The WO now records this as R6-R8. Per AGENTS.md §6 it stays OPEN — no speculative
+fix.
+
+**Pending / next**:
+- **Next WO9.0.0 wave**: the P1s (003/004/005 sandbox + 104/105/106 serve/deploy), the P2
+  riders (006-009 + 107), and the new **108** (daemon SIGTERM deadlock). WO9.0.0-011 stays open
+  with its root cause unconfirmed — it recurred again on 2026-10-21 (see below).
+- **Release v2.3.0** when ready — WO7+WO8+the WO9 P0 wave warrant it.
+- **Docker push** when tooling exists (WO5-014 runbook).
+
+# ═══ SESSION HISTORY ═══
+
+## Session 2026-10-21 (a): nightly red resolved end-to-end; main = dev = 37584adc
+
+**Version**: 2.2.0 (pyproject.toml source of truth). Released 2026-08-20, live on PyPI.
+
+**Branch state**: `main` = `dev` = `37584adc`. ALL green at that exact SHA: dev push CI
+39522593783, main push CI 39522988931, Security Scan 39522988935, **Dependency Audit
+39523014316** ("No known vulnerabilities found"). Daily `PicoSentry CI` nightly red is gone
+three ways: (1) cron removed from the default branch (d19d18dc reached main — schedules
+always run from the default branch), (2) `dependency-audit` extracted to
+`.github/workflows/dependency-audit.yml` — its own ~2min daily 03:00 UTC schedule +
+standalone `gh workflow run dependency-audit.yml` dispatch, proven green on a real runner,
+(3) `nightly-tests` stays dispatch-only until it can fit GitHub's 6h job cap (it was being
+cancelled at 6h every night — never a verdict).
+
+**Completed this session (2026-10-20/21)**:
+- fix(ci): dependency-audit switched from `uv run --with`/`uvx` to `pipx run --spec
+  pip-audit` — the 2026-10-02 uvx change had only removed the OUTER ensurepip;
+  pip-audit's own `-r` venv creation dies in ensurepip under uv-managed CPython on the
+  runner (proven from run 39392964257: `requirement.py _collect_from_files` →
+  `ve.create` → exit 1). pipx runs on the runner's system python.
+- ci: audit extracted to its own workflow — dispatchable in ~2min instead of paying for
+  the 6h nightly; schedule independent of the nightly tier (a security product's
+  dependency-advisory feed must not be collateral of its test-suite budget).
+- fix(deps): **certifi 2026.5.20 → 2026.10.19** — PYSEC-2026-4320, caught by the audit's
+  FIRST successful runner execution (compromised eMudhra intermediates under the emSign
+  ECC Root CA G3, MITM-able TLS interception; fix restores only unaffected emSign roots).
+  Local re-audit: no known vulnerabilities. Third instance of "the audit tool that never
+  ran was hiding real CVEs" (after 2026-10-02's 18).
+- test(serve): `test_all_chains_1000_artifacts_under_500ms` measures `process_time`, not
+  wall clock — flaked 0.591s vs 0.5 on the 3.11 push leg under xdist load (rerun of the
+  same commit passed = flake confirmed before editing; local wall AND cpu ~0.045s, so the
+  gap was runner descheduling). WO7 gateway-test remedy; the CPU ceiling keeps full teeth
+  for the algorithmic regression the test guards.
+
+**Gates (final, head `37584adc`)**: ruff All checks passed · format 763 files · mypy 417
+source files clean · `bash scripts/test.sh fast` **5965 passed / 37 skipped / 0 failed**
+(127s) · `tests/test_ci_paths.py` 35 passed · both workflow files parse. lessons.md
+2026-10-20 and 2026-10-20/21 have the full chains (incl. the `gh workflow run` needs-
+default-branch trap and the empty-`$rid` poll bug).
+
+**Completed series**:
+- **WO7.0.0**: 34/34 DONE (security/correctness wave — OSV crates.io drop, encoded-dot SSRF, gRPC audit tenancy, correlation_chains cross-tenant clobber, health probe lightweight, helm chart fix). Migrations 24 (correlation_chains UNIQUE(org_id, artifact_id)) + 25 (alerts `acknowledged` column). main ff'd to `8c3a68e2`, push CI green.
+- **WO8.0.0**: 22/22 DONE (3 waves, 6 subagent worktrees — gRPC Scan orphaned jobs/inline DoS, L4 profiler op-types, serve helm readOnlyRootFilesystem crash/path mismatch, scheduler naive datetime, correlation O(N), cross-worker 404, threat score O(N²) decay, dead acknowledge_alert, pending_alerts sent-vs-acknowledged, serve monitoring alerts, duplicate annotations). Gate: 5966 passed / 37 skipped (1 pre-existing xdist determinism flake, passes in isolation). ruff/format/mypy clean.
+
+**WO5 remainders** (CLOSED series, 3 honest PARTIALs):
+- **WO5-014**: Docker Hub push blocked (no container tooling/creds on host). Runbook in WO file. All claims made honest ("push pending"). Unblocks when docker+buildx installed.
+- **WO5-029**: Watch fused-pass <1s/MB target — 12% landed (3.91→3.44 s/MB CPU), full fused pass still pending.
+- **WO5-031**: Multi-worker e2e isolation — core landed (outbox, leader lease, rate-limit sync, WS queues, sqlite busy_timeout, helm chart), 2-real-worker e2e tests pending.
+
+**Pending / next**:
+- **Release v2.3.0** when ready — WO7+WO8 are two significant security/correctness waves (57 WOs total), warrant a release. Flow: gates green on dev → ff main → bump version (17-file lockstep) → reproducible build → publish.
+- **Docker push** when tooling exists (WO5-014 runbook).
+- **Next explorer round**: WO9.0.0 series (next free series) — no WOs seeded yet. Areas worth probing: WO5-029 fused-pass target, WO5-031 2-worker e2e, watch slow-tier non-typosquat rule cost (155s), any regressions from WO8.
+
+**Blocked**: Docker Hub push (tooling + credentials) — WO5.0.0-014.
+
+**2026-10-02 — recurring red gates fixed (dev `0c5a1853`)**: four failures in the
+scheduled PicoSentry CI resolved at source — `dependency-audit` died in
+`ensurepip` (now `uvx`); the audit that finally ran exposed 18 real CVEs
+(PyJWT floor -> `>=2.15.0`, lock: pyjwt 2.15.1 / urllib3 2.8.0 / anyio
+4.14.2+4.15.1, re-audit clean); `test_validation_report_is_deterministic` blew a
+hardcoded `timeout(180)` that predated the 5,667-fixture corpus (one pass is
+213s) — read-only consumers now share a cached `run_validation()` while the
+determinism test keeps two real passes; and
+`test_fail_closed_policy_rejects_fallback` read the overloaded
+`SandboxResult.degraded` flag as "backend degraded" when the seccomp exec path
+uses it for the 126/127 exit-ambiguity marker (WO5.0.0-019), demanding an
+L3-SANDBOX-DEGRADE event that is correct not to exist. Gates: ruff/format/mypy
+clean, `scripts/test.sh fast` 5965 passed / 37 skipped. Branch protection on
+`main`+`dev` now requires real PR contexts under Actions app 15368 (the old
+`postgres-live-test (15)/(16)` + `PicoDome Admission Real-Cluster Matrix` contexts
+were push/schedule-only and could never satisfy a PR).
+
+**ESCALATE — RESOLVED 2026-10-02 (was: needs a decision, security-shaped)**: seccomp-bpf cannot
+express path-scoped filesystem rules, but `L3-FILE-W-001` advertises "Write to
+temp and stdio only" with a `/tmp/**` allowlist. Measured: a workload under the
+default policy can create a file in `$HOME` (seccomp does not block it), and
+`test_sandbox_blocks_file_write` — which sits in `TestSeccompBackend` and asserts
+exactly that path-scoped blocking — only ever passed because a leftover
+`/tmp/seccomp_test_should_be_blocked` from a previous run made `touch` take the
+`utimensat` path. LandlockBackend can enforce paths (`LANDLOCK_RULE_PATH_BENEATH`)
+and already tests it
+(`test_write_outside_workspace_gets_eacces`, real-exec: non-zero exit + EACCES +
+file-not-created — this session initially and wrongly claimed landlock had no
+file-write test; it did, and better than the misfiled seccomp test). Open: (1) does the policy overclaim, or is
+seccomp the wrong backend to trust for it, (2) move the test to the landlock
+suite? Details + the fix I got wrong in `lessons.md`. **Deterministic, not a
+flake** (proven both ways): the test passes iff a stale
+`/tmp/seccomp_test_should_be_blocked` exists, so it is red on every clean
+machine and fresh CI checkout. Any "green" fast-suite number quoted for this
+head is only valid on a box that already ran the suite — re-verify from a clean
+`/tmp` before trusting it.
+
+**Resolution (2026-10-02)**: user ruled no overclaims — `L3-FILE-W-001`'s description now states
+plainly that its `/tmp/**` list is a grant ceiling that landlock scopes by path and seccomp-bpf
+cannot scope at all, with a `ceiling:` annotation recording the measurement and upgrade path.
+`TestSeccompBackend::test_sandbox_blocks_file_write` was **retired, not relocated** — the landlock
+suite already covers the capability with stronger assertions, so moving it would have duplicated
+coverage rather than preserved it. `scripts/test.sh fast` is now **5965 passed / 37 skipped /
+0 failed from a clean `/tmp`**, which the earlier number in this file was not. Landlock real-exec
+still skips on this host, so that coverage is verified in the `landlock-real-exec` CI job.
+
+Tracked forward as **WO9.0.0-010** (`docs/workorders/WO9.0.0-010-landlock-per-policy-write-paths.md`,
+P1/M): the remaining enforcement gap, with the full probe ledger (P1-P8: what was measured and
+what each result means) and six traps for whoever picks it up — notably *clean `/tmp` before quoting
+any green fast-suite number*, and *zero grep hits means wrong needle, not absence*.
 
 # ═══ SESSION HISTORY ═══
 
@@ -1515,3 +1698,8 @@ The `docker-build-arm64` job in `.github/workflows/ci.yml` builds and tests an a
 - None.
 ### Blocked
 - None.
+
+### Active (2026-10-02)
+
+- **WO9.0.0-011 (events-history global state)** — `test_org_stamped_event_round_trips_with_uuid_id` failed once in CI (run 37026978303, py3.11) with `published event id … not in []`. Root cause unconfirmed: `event_bus` is process-global, `event_bus.shutdown()` (server.py:295/463) clears `event_history` on app lifespan teardown; fixture clears it too. Added a named diagnostic to the test (must show the teardown as cause if it hits). Repro attempts locally on 3.10/3.11: green (5x). See `docs/workorders/WO9.0.0-011-events-history-global-state-flake.md`. Next: if diagnostic fires, decide ownership (do not clear history on shutdown vs keep and defend). Do not rewrite test or relax assertion.
+

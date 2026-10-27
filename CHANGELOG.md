@@ -2,6 +2,157 @@
 
 All notable changes to PicoSentry will be documented in this file.
 
+## 2026-10-21 - CI jobs bounded with timeout-minutes; postgres-live caught a boolean-column bug in a test; daemon SIGTERM deadlock filed
+- **Every job in `ci.yml` now sets `timeout-minutes`.** None did before, so every job inherited
+  GitHub's 6h default cap — a hang was invisible until a human noticed and killed it. Observed:
+  the `test-matrix (3.13)` leg hung on a runner and burned three hours before being cancelled.
+  Bounds are sized from the observed green runtimes with generous headroom (15/20/30/45/180 min);
+  the integration tier finishes in ~90s, so 30 min is safety, not a way to make red go green.
+  `tests/test_ci_paths.py::test_every_ci_job_has_a_timeout` pins it so a new job cannot
+  reintroduce the unbounded default.
+- **The 3.13 hang was a runner flake, not a regression** — recorded because the reasoning matters:
+  the previous push carried the ENTIRE WO9.0.0 P0 cluster and had 3.13 green in 89s; the hanging
+  push differed by a single test parameter (`sent = 1` -> `True`) that cannot cause a 3-hour hang;
+  the re-run had 3.13 green in 88s. Worth noting: **Python 3.13 changed the default
+  multiprocessing start method to `forkserver`** (3.10 uses `fork`) — the same class as
+  WO5.0.0-035, and now a known variable for any new test that waits on a spawned worker.
+- fix(test): **the acknowledge test wrote an integer into a BOOLEAN column.** The postgres-live
+  job (18) failed on the WO9.0.0-102 merge with `psycopg2.errors.DatatypeMismatch: column "sent"
+  is of type boolean but expression is of type integer` — the test inserted `sent` as the integer
+  `1`. Harmless on SQLite (dynamically typed), fatal on postgres, and invisible because the file
+  was never in the postgres-live job's file list. Now passed as `True` (a parameter, so psycopg2
+  adapts it to a real boolean). Same bug class as WO9.0.0-102, one layer out — the WO found it
+  in production code, the postgres-live job then found it in the test that was supposed to cover
+  it. **Adding a file to a backend-specific job is expected to fail on something in that file;
+  that failure is the point of adding it.**
+- docs(workorders): **WO9.0.0-108 filed (P1, not fixed)** — the scan daemon's SIGTERM/SIGINT
+  handler calls `server.shutdown()` from the thread running `serve_forever()`, which is the
+  documented deadlock shape (a signal handler runs on the main thread, and `shutdown()` waits on an
+  event only `serve_forever()`'s exit path can set). Proven in both directions: hangs with
+  `serve_forever()` on the main thread (the daemon's shape), clean on a worker thread. Every
+  `docker stop` / systemd stop / CI teardown of the daemon pays the full kill timeout. No test
+  catches it because the daemon tests mock `HTTPServer` outright. Left as its own WO to keep the
+  P0 cluster's diff scoped and gated.
+- **WO9.0.0-011 recurred and was confirmed as the known flake, not a regression**: the
+  docs-only commit `6367ed60` went red on `test-matrix (3.14)` with
+  `published event id ... not in []` — the exact symptom that WO documents (its root cause is
+  still unconfirmed). Confirmed on the evidence: no commit in this series touches `event_bus`,
+  `event_history`, `server.py` or the app lifespan; the test passes 5/5 in isolation and in the
+  whole `tests/serve/` suite on 3.14; and `gh run rerun --failed` on the SAME SHA went green
+  (run 39692526428 now `success`, all five matrix legs). The WO records this as R6-R8. It stays
+  OPEN — per AGENTS.md §6 a speculative fix here is how a security suite acquires a test that
+  asserts nothing.
+- **`main` fast-forwarded to `dev` (`c885eb3d`)** — green-before-ff, as the standing rule
+  requires: dev push CI 39662046225 green at `0009c7a0` (all jobs), the follow-up `6367ed60`
+  green on 39692526428 after the known WO9.0.0-011 flake was re-run at the same SHA, and
+  `c885eb3d` is docs-only on top (ci.yml `paths-ignore: '**.md', 'docs/**'` → CI skipped by
+  design; the non-doc tree at `c885eb3d` is byte-identical to the green `6367ed60`). Security
+  Scan on `main` green at `c885eb3d` (39694561006).
+- Gates: ruff clean, format 764 files, mypy 417 source files clean, `scripts/test.sh fast`
+  **5996 passed / 37 skipped / 0 failed**. Push CI **39662046225 all-green at `0009c7a0`**
+  (5-Python matrix, postgres-live 15/16/17/18, docker amd64+arm64, reproducible-build,
+  landlock-real-exec, scan-artifacts-push); the follow-up docs commit `6367ed60` green after
+  the WO9.0.0-011 re-run.
+
+## 2026-10-21 - WO9.0.0 P0 cluster: 4 real security bugs fixed, 1 closed as a false positive
+- **Four of the five WO9.0.0 P0 work orders were real bugs and are fixed**; the fifth
+  (**WO9.0.0-103**) was a **false positive** and is closed with the re-verification rather than
+  "fixed". Every claim was re-checked against source before any of them was touched.
+- fix(serve): **webhook SSRF bypass via empty `pinned_ips`** (WO9.0.0-101). `_load_webhooks` set
+  `pinned_ips = resolve(host) or []` with no empty-check, so a hostname that did not resolve was
+  loaded with an EMPTY pin set. At dispatch the DNS-rebind guard was
+  `webhook.pinned_ips is not None and not current_ips.issubset(allowed_ips)` — and
+  `set().issubset(set())` is True, so the guard passed **vacuously** and the POST went out with no
+  IP restriction whenever DNS was dead at dispatch time. The load path now skips an unresolvable
+  hostname (mirroring `create()`'s existing guard) and the dispatch guard rejects an empty pin set
+  OR an empty current set, so an empty set can never satisfy the subset check. `pinned_ips` is now
+  always a non-empty list in the dispatch path (the `if wh.pinned_ips else None` copy was dead).
+- fix(serve): **`acknowledge_alert` returned 500 on every Postgres deployment** (WO9.0.0-102).
+  `alerts.acknowledged` is a BOOLEAN column (migration 25) but was missing from the runtime
+  boolean-literal translator, so `UPDATE alerts SET acknowledged = 1` reached postgres as an
+  integer literal against a boolean column ("operator does not exist: boolean = integer"). Fixed
+  systemically — `acknowledged` added to the translator, with a comment that the list must track
+  the BOOLEAN columns in `_schema.py` — and the call site now uses the portable `= TRUE` form, so
+  the write is correct without relying on the translator. **Rider**: the acknowledge test file is
+  now in the `postgres-live-test` CI job, because boolean-column writes are only exercised
+  against a real postgres — which is why this shipped broken for two releases — and a guard test
+  in `tests/test_ci_paths.py` pins that membership.
+- fix(sandbox): **admission control was a complete no-op** (WO9.0.0-001). The admission scanner
+  read `result.get("verdict")` and `result.get("findings")`, but the daemon's `/api/v1/scan`
+  response carries `l3_verdict` / `l4_verdict` / `findings_count` and an `analysis` dict. Every
+  scan therefore looked CLEAN with no findings and **no pod was ever blocked**, even with a
+  MALICIOUS verdict. The scanner now reads the real shape (l3 `ALLOW`/`DENY`/`KILL`, l4
+  `CLEAN`/`SUSPICIOUS`/`MALICIOUS`, per-finding severity from `analysis.findings`) and
+  normalizes finding severity case — findings serialize UPPERCASE ("HIGH") while
+  `SEVERITY_LEVELS` is keyed lowercase, so every HIGH finding scored 0 and never crossed
+  `min_severity`. **A response with no verdict AND no findings is now UNREADABLE and denies under
+  the existing fail-closed default** — the original bug was silent, so the safety net matters as
+  much as the fix.
+- fix(sandbox): **L4-PRIVESC-003 setuid-chmod detection was dead** (WO9.0.0-002). The rule matched
+  command prefixes (`"chmod 4"`, `"chmod 47"`) against `op.path`, which is a FILE PATH — the
+  setuid/setgid bits live in the chmod MODE argument, which the profiler matched with `\S+` and
+  then discarded. A postinstall script doing `chmod 4755 /usr/bin/sudo` was invisible.
+  `FileOperation` now carries a `mode` field (from the stdout chmod regex and from a `file_chmod`
+  event's detail — `"chmod 4755 /path"`, `"mode=4755"`, or a bare mode), and the rule tests the
+  setuid (04000) / setgid (02000) bits of the octal mode. Only numeric modes count (a symbolic
+  `"+x"` says nothing about setuid, and guessing would produce false CRITICALs) and a chmod with
+  no reported mode is NOT flagged — the mode is the only evidence, so it is never inferred from the
+  path.
+- **WO9.0.0-103 (release.yml cosign "double-v" tag) is a false positive — closed, not fixed.** The
+  WO's repro computed the cosign target from line 125's `TAG`, but the cosign step is its own
+  `run:` block and recomputes `TAG` on ITS line 156 as `TAG="${GITHUB_REF_NAME#v}"` — without the
+  v prefix — so its `v${TAG}` is the same `:v2.2.0` the bake step pushes. Verified by evaluating
+  every image reference in the docker job as bash would: bake `:v2.2.0`, exists-gate `:v2.2.0`,
+  cosign `:v2.2.0`, `docker run` `:v2.2.0`, for tag forms `v2.2.0` / `2.2.0` / `v2.2.0-rc1` /
+  `release-2.2.0` — all MATCH. **The WO's proposed edit would have signed `2.2.0`, a tag that does
+  not exist, breaking every release.** No code change is made; instead the cosign step says why
+  its `TAG` is bare, and a new test runs each step's REAL shell body with stubbed docker/cosign
+  and asserts every image reference resolves to the same tag (mutation-checked: applying the
+  WO's edit makes it fail with exactly the claimed symptom).
+- **Two of the five bugs had tests that were validating the bug.** The admission mock daemon
+  spoke a made-up `verdict`/`findings` response shape that the scanner happened to read, so the
+  old tests passed while the real daemon's response was never understood; and the setuid-chmod test
+  put a command string in the PATH field (`path="chmod 4755 /usr/bin/custom"`) that no backend
+  produces. Both now build their input from the **producer's** contract. Also fixed a
+  pre-existing test-isolation leak: `MockScanHandler.do_POST = alternating_post` replaced the
+  class method permanently and leaked into later tests (now `monkeypatch`), and the fixture
+  resets the handler's class-level response state on entry and exit.
+- Gates: ruff All checks passed · format 763 files already formatted · mypy 417 source files
+  clean · `bash scripts/test.sh fast` **5995 passed / 37 skipped / 0 failed** (baseline 5965 —
+  +30 tests, none weakened). Worktree `wo/9.0.0/p0-cluster` off `origin/dev`; **not yet merged to
+  dev** (see state.md "Pending / next").
+
+## 2026-10-21 - audit extracted to its own workflow; first real run caught a real CVE (certifi); perf-ceiling flake fixed
+- **`dependency-audit` extracted from `ci.yml` to `.github/workflows/dependency-audit.yml`** — its own ~2min workflow (daily 03:00 UTC schedule + `workflow_dispatch`). Rationale: a security product's dependency-advisory feed must not be collateral of its test-suite budget, and dispatching the audit alone now costs ~2 minutes instead of the full 6h nightly (which GitHub caps and was cancelling every night — `nightly-tests` never produced a verdict). `ci.yml` keeps a pointer comment; `code_re` already matched `\.github/workflows/` so no path-filter change. `tests/test_ci_paths.py` 35 passed.
+- **The pipx tool chain is now proven on a real runner.** First dispatch (run 39520595894) failed for the right reason: pipx ran pip-audit end-to-end (no inner ensurepip crash — the 2026-10-20 diagnosis was correct) and **found a real advisory**: `certifi 2026.5.20`, PYSEC-2026-4320 (compromised eMudhra root certs under the emSign ECC Root CA G3 — MITM-able TLS interception; fix `2026.10.19` restores only unaffected emSign roots).
+- fix(deps): **`uv lock --upgrade-package certifi` → 2026.10.19**, closing PYSEC-2026-4320. Local re-audit clean ("No known vulnerabilities found"). Re-dispatch from main@`37584adc`: run 39523014316 **success** — full loop (dispatch → red with a real CVE → bump → green) proven end-to-end in ~30 min. This is the third instance of "the audit tool that never ran was hiding real CVEs" (after 2026-10-02's 18).
+- fix(test): **`test_all_chains_1000_artifacts_under_500ms` measured wall clock under xdist** and flaked at 0.591s vs 0.5 on the 3.11 push leg only (rerun of the same commit passed = flake confirmed *before* touching code; local wall AND cpu both ~0.045s, so the gap was runner descheduling). Now measures `time.process_time()` — same remedy as the WO7 gateway test; the CPU ceiling keeps full teeth for the algorithmic regression the test guards.
+- **Schedule red closed three ways**: (1) cron removed from the default branch (schedules only ever run from `main`), (2) audit split out and green on its own schedule, (3) `nightly-tests` stays dispatch-only until split/trimmed to fit the 6h job cap.
+- Gates: ruff clean, format clean (763 files), mypy clean (417 source files), `bash scripts/test.sh fast` **5965 passed / 37 skipped / 0 failed** (127s) at `37584adc`. Push CI green on **dev** (39522593783) and **main** (39522988931 + Security Scan 39522988935); Dependency Audit 39523014316 success. main ff'd green-before-ff.
+
+## 2026-10-20 - nightly red stopped at source: schedule only ever ran from main; audit tool's inner ensurepip
+- **Why the nightly `PicoSentry CI` kept failing after the 2026-10-02 fixes**: GitHub schedules workflows from the **default branch only**, and `main` sat 10 commits behind `dev` — every night (2026-09-14..10-20) it ran main's old workflow: the pre-`uvx` `uv run --with pip-audit` command and the cron that the 2026-10-04 commit had disabled *on dev only*. The uvx fix and the cron disable never reached the schedule until `main` was ff'd to `dev`.
+- fix(ci): **`dependency-audit` — the real ensurepip failure is inside pip-audit, not its launcher.** The 2026-10-02 `uvx` change removed the outer `uv run --with` venv bootstrap, but for `-r` files pip-audit creates its *own* venv (`requirement.py _collect_from_files` → `ve.create`) bootstrapped via `python -m ensurepip` under whatever interpreter runs it — and that exits 1 under uv-managed CPython on the runner (proven from run 39392964257 logs: both launch paths die at the same inner step). The job now runs `pipx run --spec pip-audit pip-audit`, which uses the runner's system python, whose ensurepip works. Honest caveat: dispatch-only from here (cron removed), so the pipx command's first real-runner execution will be the next manual `workflow_dispatch` of the nightly tier.
+- **`nightly-tests` was never a verdict — it hit GitHub's 6h job cap** (started 08:22, cancelled 14:23; its budget-report step then fails on the missing junit). If the nightly tier is ever re-enabled, the suite must be split or trimmed to fit.
+- Gates: fast tier `5965 passed / 37 skipped / 0 failed` (180s), `tests/test_ci_paths.py` 35 passed, ci.yml parses. Push CI green at `a799ed79` on **dev** (run 39501228689) and **main** (run 39501898699) + Security Scan (39501898727); main ff'd green-before-ff. Next scheduled run: none (cron gone from the default branch).
+
+## 2026-10-02 - recurring red gates: 4 root-caused fixes (audit tool, 18 CVEs, validation timeout, seccomp `degraded` overloading)
+- **Four failures in the scheduled `PicoSentry CI` workflow, each fixed at source** (run `36990638062`; `dependency-audit` had been red every night 2026-09-14..10-02). Gates after: ruff check + format clean, mypy clean (417 files), `scripts/test.sh fast` **5965 passed / 37 skipped** on this dev box — but see the ESCALATE below: that run inherited a stale `/tmp` file, and on a clean tree the suite is **5965 passed / 37 skipped / 1 failed** (pre-existing, unrelated to these four fixes).
+- fix(ci): **`dependency-audit` never started.** `uv run --with pip-audit` builds an ephemeral venv and bootstraps it via `python -m ensurepip`, which exits 1 on the current runner image before pip-audit runs. Now `uvx --from pip-audit pip-audit`.
+- fix(deps): **18 real advisories closed** — the audit that finally ran exposed them. `PyJWT>=2.8.0` -> `>=2.15.0` (2.13.0 carried 12: empty-oct-JWK auth bypass, JWKS redirect header leak, uncaught RecursionError DoS, PEM ReDoS, incomplete algorithm-confusion fix; 2.15.0 is the first release with the payload-parser fix). Lock: `pyjwt` 2.15.1, `urllib3` 2.8.0, `anyio` 4.14.2 (py<3.15) / 4.15.1. Re-audit: no known vulnerabilities.
+- fix(test): **`test_validation_report_is_deterministic` red every night** — a hardcoded `@pytest.mark.timeout(180)` predated the corpus reaching 5,667 fixtures and could not fit even one `run_validation()` pass (measured 213s). The three read-only consumers (required-fields / 100%-precision-recall floor / negative-FP sanity) now share a `functools.cache`d wrapper, mirroring the file's existing cached fixture discovery; the determinism test deliberately keeps **two uncached** passes (~469s) since caching it would make it vacuous. Stale caps removed so the profile's `--timeout` governs (900s nightly, 300s full now fits the cached consumers). `4 passed in 715.54s`.
+- fix(sandbox): **`test_fail_closed_policy_rejects_fallback` red on every runner where seccomp is available.** It asserted `degraded is False or any(L3-SANDBOX-DEGRADE)`, reading `SandboxResult.degraded` as "the backend degraded". It is not: `seccomp_backend.py` sets `degraded=exit_code in (126,127)` on the normal exec path as the deliberate 126/127 exit-ambiguity marker (WO5.0.0-019) and already emits `L3-EXEC-001/002` for it, while *backend* degradation is what `_fallback_run` reports via an `L3-SANDBOX-DEGRADE` event. The assertion demanded an event that is correct not to exist, and contradicted the very next line. Now asserts the fail-closed property its own comment names: no `L3-SANDBOX-DEGRADE`, and no `_fallback_run` fail-closed signature (`isolation_level != "none"`, `enforcement_guarantee != "none"`). `14 passed`.
+- fix(ci): **branch protection on `main`+`dev`** required three contexts that a PR could never produce — `postgres-live-test (15)`, `postgres-live-test (16)`, `PicoDome Admission Real-Cluster Matrix` (push/schedule-only). Replaced with the real PR-gated contexts under GitHub Actions app `15368`: `lint`, `type-check`, `test-fast`, `cli-verification`, `determinism-check`, `strict=true`.
+- **ESCALATE (not fixed, needs a decision)**: seccomp-bpf filters syscalls, not paths, so it cannot express `L3-FILE-W-001` ("Write to temp and stdio only", `/tmp/**`). Measured: under the default policy a workload can create a file in `$HOME` — seccomp does not block it. `test_sandbox_blocks_file_write` sits in `TestSeccompBackend` and asserts precisely that path-scoped blocking; it only ever passed because a leftover `/tmp/seccomp_test_should_be_blocked` from a prior run made `touch` take the `utimensat` path (`/tmp/**` is allowed, so the test never matched its own docstring). `LandlockBackend` can enforce paths (`LANDLOCK_RULE_PATH_BNEATH`).
+  - **Retraction:** this entry originally said landlock "has no file-write test". That was wrong — I had grepped for `file_write`/`blocks_file_write` and missed that the landlock suite names them by behaviour (`test_write_outside_workspace_gets_eacces`, `test_write_inside_workspace_succeeds`, `test_default_policy_has_no_bare_tmp_write`, `test_write_paths_tightened_to_workspace`). Landlock coverage was already better than the misfiled seccomp test: real-exec, asserts non-zero exit + EACCES + file-not-created. See `state.md` + `lessons.md`.
+- **Correction — this is deterministic, not a flake.** Proven both directions: with `/tmp/seccomp_test_should_be_blocked` absent the test **fails**; with it present the test **passes** (absent -> `touch` takes `open(O_CREAT)`, which `/tmp/**` allows -> ALLOW; present -> `utimensat`, which the syscall filter blocks -> KILL). So the test is red on *any* clean machine and fresh CI checkout, and green only on a box that has already run the suite. It was recorded as an intermittent xdist flake earlier in this session; that was wrong, and the earlier one-line `tmp_path` proposal was wrong with it (`tmp_path` is under `/tmp/**`, i.e. also allowed). Left unmodified pending the decision above rather than rewritten to green.
+
+## 2026-10-02 - sandbox: honest path-scoped write claim + misfiled test retired (closes the 2026-10-02 ESCALATE)
+- **Overclaim fixed at source.** `L3-FILE-W-001` shipped the description *"Write to temp and stdio only"* alongside a `/tmp/**` path list. That read as a promise the enforcement does not keep: seccomp-bpf filters syscalls and has no path awareness, so under seccomp a workload may create a file anywhere the kernel permits (measured — a `$HOME` write succeeded, `verdict=ALLOW`). Description now says what it is — a *grant ceiling*, path-scoped under landlock, not scopeable by seccomp — and carries a `ceiling:` annotation naming the gap and the upgrade path (seatbelt; there is no seccomp equivalent). Rule ids, targets and paths are unchanged, so no policy signature or consumer moves.
+- **Misfiled test retired, not moved.** `TestSeccompBackend::test_sandbox_blocks_file_write` asserted path-scoped write blocking from a backend that architecturally cannot provide it. It only ever passed because a stale `/tmp/seccomp_test_should_be_blocked` existed (absent -> `open(O_CREAT)`, allowed by `/tmp/**`; present -> `utimensat`, blocked by the filter), so it was red on every clean machine and fresh CI checkout. **No coverage was lost by removing it rather than relocating it**: `tests/sandbox/test_landlock_backend.py` already covers the capability with *stronger* assertions — `test_write_outside_workspace_gets_eacces` is real-exec and asserts non-zero exit, `Permission denied` on stderr, and that the file was **not** created, plus two policy->ruleset translation tests. It also records why a blocked write is not a verdict: verdicts are event-driven (WO5.0.0-019), so EACCES yields `ALLOW` — which is the opposite of the `KILL/DENY` the seccomp test expected. A comment at the removal site points at all four landlock tests so it is not re-added.
+- **Reproducible now:** `scripts/test.sh fast` is **5965 passed / 37 skipped / 0 failed from a clean `/tmp`**, which the previous commit's number was not (it inherited the stale artifact). ruff check + format clean, mypy clean (417 files).
+- **Still honest about what is not fixed:** landlock enforces a workspace-tightened path set and does not yet honour arbitrary per-policy paths — `docs/manual.md` already discloses this in three places (lines 931, 948, 2580). Unbounded write globs are refused outright (`ceiling: list paths` in `landlock_backend._build_grants`). Landlock real-exec tests skip on this host (no landlock) and execute in the `landlock-real-exec` CI job, so the relocated coverage is verified in CI, not locally.
+
 ## 2026-08-22 - WO8.0.0 series seeded (22 workorders from two-explorer round)
 - docs(workorders): **WO8.0.0 series created** — 22 workorders from a two-explorer read-only round (scan+sandbox+watch / serve+core+deploy+firewall), ~22 verified findings. P0×5, P1×10, P2×7. No code changed. Headline P0s: gRPC Scan orphaned running jobs on failure (001), gRPC Scan inline DoS — blocks Health RPC (008), L4 profiler only emits read/write ops — create/delete/chmod rules dead (009), serve helm chart readOnlyRootFilesystem crash on boot (101), serve helm chart Dockerfile-vs-helm path mismatch (102). Suggested batch shape in README.
 
@@ -1835,3 +1986,10 @@ Legacy repository history (archived, read-only):
 ## 2026-07-29 - Process timeout orphan fix
 
 - fix(scan): kill orphaned processes on timeout (P0-5) — add kill() fallback after terminate() + join(1) timeout in workspace scanner
+
+## 2026-10-02 - WO9.0.0-011: event-history global state diagnostic (root cause unconfirmed)
+
+- test(serve): add explicit diagnostic assertion in `test_org_stamped_event_round_trips_with_uuid_id` (WO9.0.0-011). `event_bus` is a process-global; app lifespan teardown calls `event_bus.shutdown()` (server.py:295,463) which clears `event_history` — the subscriber half is already worked around in `test_killchain_tenancy.py` (re-registers `EnhancedOrchestrator`), the history half was unguarded. The new assertion names this exact cause if history is lost between `publish()` and the query, preventing `not in []` from being reported without context. No test logic weakened; no retries added.
+- docs(workorders): create `WO9.0.0-011-events-history-global-state-flake.md` (root cause not confirmed after 5 local repro attempts on 3.10/3.11, CI rerun passed same SHA). Add row to `docs/workorders/README.md`.
+- state.md: log active WO9.0.0-011.
+

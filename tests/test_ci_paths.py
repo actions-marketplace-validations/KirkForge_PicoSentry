@@ -81,3 +81,48 @@ def test_code_filter_classifies_paths(path: str, expected: bool) -> None:
 )
 def test_scan_filter_classifies_paths(path: str, expected: bool) -> None:
     assert bool(_ci_filter("scan_re").search(path)) is expected, path
+
+
+def test_postgres_live_job_covers_boolean_column_writers() -> None:
+    """WO9.0.0-102: `alerts.acknowledged = 1` broke on Postgres for two
+    releases because the acknowledge endpoint's test file was not in the
+    postgres-live job's file list — the boolean-literal bug only shows on a
+    real BOOLEAN column. Pin the coverage so a future boolean-column writer
+    cannot ship unexercised on Postgres."""
+
+    text = (_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    match = re.search(r'FILES="([^"]+)"', text)
+    assert match, "ci.yml no longer defines the postgres-live FILES list"
+    files = match.group(1).split()
+    assert "tests/serve/test_wo7_acknowledge_alert.py" in files, (
+        "the acknowledge-alert test must run in the postgres-live job: "
+        "BOOLEAN-column writes are only exercised against a real postgres"
+    )
+
+
+def test_every_ci_job_has_a_timeout() -> None:
+    """A CI job with no `timeout-minutes` inherits GitHub's 6h default cap.
+
+    Observed 2026-10-21: the `test-matrix (3.13)` leg hung on a runner and
+    burned three hours of runner time before it was cancelled — with no
+    bound, a hang is invisible until someone notices and kills it, and it
+    costs the whole 6h budget every time it recurs.
+
+    Every leg here finishes in minutes (the slowest observed is the
+    integration tier at ~5 min), so the bounds below are pure safety
+    headroom, not a way to make red go green. A leg that legitimately needs
+    longer should raise its own bound in the same commit that proves why.
+    """
+    import yaml
+
+    workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    jobs = workflow["jobs"]
+    assert jobs, "ci.yml defines no jobs"
+
+    unbounded = [name for name, job in jobs.items() if "timeout-minutes" not in job]
+    assert not unbounded, f"CI jobs without timeout-minutes (they inherit the 6h cap): {unbounded}"
+
+    for name, job in jobs.items():
+        bound = job["timeout-minutes"]
+        assert isinstance(bound, int), f"{name}: timeout-minutes must be an int, got {bound!r}"
+        assert 1 <= bound <= 360, f"{name}: timeout-minutes {bound} is outside a sane range"
